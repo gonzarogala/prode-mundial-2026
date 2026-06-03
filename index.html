@@ -92,6 +92,12 @@ select.adv-sel{width:auto!important;flex:1;min-width:110px;font-size:12px;paddin
 .elim-radio{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;font-weight:600;cursor:pointer;padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);background:rgba(0,0,0,0.18)}
 .elim-radio input{width:15px;height:15px;cursor:pointer;accent-color:var(--wgr)}
 .res-tag{display:inline-block;margin-left:5px;font-size:9px;font-weight:700;letter-spacing:.03em;padding:1px 5px;border-radius:6px;background:rgba(255,255,255,0.16);color:var(--text2);vertical-align:middle}
+.src-chip{display:inline-block;font-size:9px;font-weight:700;letter-spacing:.02em;padding:1px 6px;border-radius:8px;vertical-align:middle;white-space:nowrap}
+.src-chip.auto{background:rgba(0,132,61,.18);color:var(--wgr-tx)}
+.src-chip.manual{background:rgba(233,196,106,.20);color:#E9C46A}
+.src-banner{display:flex;align-items:center;gap:8px;margin:18px 0 4px;padding:8px 12px;border-radius:var(--radius-sm);font-size:12px;font-weight:700;color:var(--text2)}
+.src-banner.auto{background:rgba(0,132,61,.10);border:1px solid rgba(0,132,61,.30)}
+.src-banner.manual{background:rgba(233,196,106,.10);border:1px solid rgba(233,196,106,.35)}
 .gtable{width:100%;border-collapse:collapse;font-size:12px;table-layout:fixed}
 .gtable th,.gtable td{padding:7px 4px;text-align:center;border-bottom:1px solid var(--border)}
 .gtable th{font-size:10px;color:var(--text2);font-weight:600;background:rgba(255,255,255,0.06);text-transform:uppercase;letter-spacing:.04em}
@@ -187,7 +193,7 @@ img.twe{height:1em;width:auto;vertical-align:-0.125em;display:inline-block;margi
 <div id="sc-grupos" class="screen"></div>
 </div>
 <div id="save-status" class="save-status"></div>
-<div id="sync-badge" class="sync-badge idle" onclick="manualSync()" title="Click para sincronizar ahora"><i class="ti ti-cloud"></i> <span>Sin sync</span></div>
+<div id="sync-badge" class="sync-badge idle" onclick="silentSync(true)" title="Datos en tiempo real · click para refrescar ahora"><i class="ti ti-cloud"></i> <span>Conectando…</span></div>
 
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script src="https://cdn.jsdelivr.net/npm/@twemoji/api@latest/dist/twemoji.min.js" crossorigin="anonymous"></script>
@@ -335,6 +341,7 @@ const STATE_KEY='prode26';
 let S={players:[],predictions:{},results:{},asterisks:{},bonus:{},bonusResults:{}};
 let me=null;
 let sb=null,saving=false,savePending=false,lastLocalSaveAt=0;
+let _lastRaw=null,_stSync={status:'idle',last:0},_stBusy=false,_stWired=false;
 
 function setStatus(t,k){const el=document.getElementById('save-status');if(!el)return;el.innerHTML=t?`<span>${t}</span>`:'';el.className='save-status'+(k?' '+k:'');el.style.opacity=t?'1':'0';}
 
@@ -343,8 +350,8 @@ async function load(){
   try{
     const{data,error}=await sb.from('prode_state').select('value').eq('key',STATE_KEY).maybeSingle();
     if(error)throw error;
-    if(data&&data.value)S=Object.assign(S,data.value);
-  }catch(e){console.error('load error',e);setStatus('Error al cargar','err');}
+    if(data&&data.value){S=Object.assign(S,data.value);_lastRaw=JSON.stringify(data.value);}
+  }catch(e){console.error('load error',e);setStatus('Error al cargar','err');_stSync={status:'err',last:0};}
 }
 
 async function pushSave(){
@@ -382,11 +389,61 @@ function rerenderCurrent(){
 function subscribeRealtime(){
   if(!sb)return;
   sb.channel('prode-state').on('postgres_changes',{event:'*',schema:'public',table:'prode_state',filter:`key=eq.${STATE_KEY}`},payload=>{
-    if(Date.now()-lastLocalSaveAt<1500)return;
-    const v=payload.new&&payload.new.value;if(!v)return;
+    const v=payload.new&&payload.new.value;
+    if(v)_lastRaw=JSON.stringify(v); // referencia al último estado del server (incluye eco propio)
+    _stSync={status:'ok',last:Date.now()};renderStorageBadge();
+    if(Date.now()-lastLocalSaveAt<1500)return; // no pisar un guardado local recién hecho
+    if(!v)return;
     S=Object.assign({players:[],predictions:{},results:{},asterisks:{},bonus:{},bonusResults:{}},v);
     rerenderCurrent();
   }).subscribe();
+}
+// ====== Sincronización automática con el storage compartido (Supabase) ======
+function isEditing(){const a=document.activeElement;return!!a&&/^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName);}
+function renderStorageBadge(){
+  const el=document.getElementById('sync-badge');if(!el)return;
+  const s=_stSync;let cls,icon,txt;
+  if(s.status==='syncing'){cls='syncing';icon='ti-loader-2';txt='Sincronizando…';}
+  else if(s.status==='err'){cls='err';icon='ti-cloud-off';txt='Sin conexión';}
+  else if(s.status==='ok'){cls='ok';icon='ti-cloud-check';txt='Actualizado';}
+  else{cls='idle';icon='ti-cloud';txt='Conectando…';}
+  el.className='sync-badge '+cls;
+  el.innerHTML=`<i class="ti ${icon}"></i> <span>${txt}</span>`;
+  el.title='Datos en tiempo real · click para refrescar ahora';
+}
+// Trae el estado del server; aplica y re-renderiza solo si cambió respecto de lo último visto.
+async function pullState(){
+  if(!sb)return{ok:false,changed:false};
+  const{data,error}=await sb.from('prode_state').select('value').eq('key',STATE_KEY).maybeSingle();
+  if(error)throw error;
+  const v=data&&data.value;if(!v)return{ok:true,changed:false};
+  const raw=JSON.stringify(v);
+  if(raw===_lastRaw)return{ok:true,changed:false};            // nada nuevo
+  if(Date.now()-lastLocalSaveAt<2000)return{ok:true,changed:false}; // recién guardamos local
+  _lastRaw=raw;
+  S=Object.assign({players:[],predictions:{},results:{},asterisks:{},bonus:{},bonusResults:{}},v);
+  return{ok:true,changed:true};
+}
+// Sync silenciosa: no interrumpe lo que el usuario esté haciendo; re-renderiza si hubo cambios.
+async function silentSync(force){
+  if(!sb){_stSync={status:'err',last:_stSync.last};renderStorageBadge();return;}
+  if(_stBusy)return;
+  if(!force&&isEditing())return; // no pisar mientras el usuario escribe un marcador/predicción
+  _stBusy=true;_stSync.status='syncing';renderStorageBadge();
+  try{
+    const r=await pullState();
+    _stSync={status:'ok',last:Date.now()};
+    if(r.changed)rerenderCurrent();
+  }catch(e){console.warn('silentSync',e);_stSync={status:'err',last:_stSync.last};}
+  _stBusy=false;renderStorageBadge();
+}
+// Conecta los disparadores automáticos (una sola vez).
+function startStorageSync(){
+  if(_stWired)return;_stWired=true;
+  setInterval(()=>silentSync(),60000); // polling cada 60s
+  document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')silentSync(true);});
+  window.addEventListener('focus',()=>silentSync());
+  document.addEventListener('click',e=>{if(e.target&&e.target.closest&&e.target.closest('.nb'))setTimeout(()=>silentSync(),0);}); // al navegar entre secciones
 }
 
 async function boot(){
@@ -394,13 +451,16 @@ async function boot(){
     document.getElementById('sc-login').innerHTML=`<div class="hero"><i class="ti ti-alert-triangle" style="color:#C5A028"></i><div class="hero-title">Configuración pendiente</div><div class="hero-sub">Editá el HTML y completá SUPABASE_URL y SUPABASE_ANON_KEY al inicio del &lt;script&gt;.</div></div>`;
     return;
   }
-  if(typeof supabase==='undefined'){setStatus('Sin conexión a Supabase','err');showLogin();return;}
+  if(typeof supabase==='undefined'){setStatus('Sin conexión a Supabase','err');_stSync={status:'err',last:0};renderStorageBadge();showLogin();return;}
   try{sb=supabase.createClient(SUPABASE_URL,SUPABASE_ANON_KEY);}
-  catch(e){console.error('init supabase',e);setStatus('Error de conexión','err');showLogin();return;}
-  await load();
-  subscribeRealtime();
+  catch(e){console.error('init supabase',e);setStatus('Error de conexión','err');_stSync={status:'err',last:0};renderStorageBadge();showLogin();return;}
+  await load();                                  // sync inicial obligatoria, antes de mostrar la UI
+  if(_stSync.status!=='err'){_stSync={status:'ok',last:Date.now()};}
+  renderStorageBadge();
+  subscribeRealtime();                           // updates instantáneos (si Realtime está habilitado)
+  startStorageSync();                            // polling 60s + foco de pestaña + cambio de sección
   showLogin();
-  startAutoSync();
+  startAutoSync();                               // sync de resultados desde football-data.org (admin)
 }
 
 const FLAGS={'México':'🇲🇽','Sudáfrica':'🇿🇦','Corea del Sur':'🇰🇷','República Checa':'🇨🇿','Canadá':'🇨🇦','Bosnia y Herzegovina':'🇧🇦','Qatar':'🇶🇦','Suiza':'🇨🇭','Brasil':'🇧🇷','Marruecos':'🇲🇦','Haití':'🇭🇹','Escocia':'🏴󠁧󠁢󠁳󠁣󠁴󠁿','Estados Unidos':'🇺🇸','Paraguay':'🇵🇾','Australia':'🇦🇺','Turquía':'🇹🇷','Alemania':'🇩🇪','Curazao':'🇨🇼','Costa de Marfil':'🇨🇮','Ecuador':'🇪🇨','Países Bajos':'🇳🇱','Japón':'🇯🇵','Suecia':'🇸🇪','Túnez':'🇹🇳','Bélgica':'🇧🇪','Egipto':'🇪🇬','Irán':'🇮🇷','Nueva Zelanda':'🇳🇿','España':'🇪🇸','Cabo Verde':'🇨🇻','Arabia Saudita':'🇸🇦','Uruguay':'🇺🇾','Francia':'🇫🇷','Senegal':'🇸🇳','Irak':'🇮🇶','Noruega':'🇳🇴','Argentina':'🇦🇷','Argelia':'🇩🇿','Austria':'🇦🇹','Jordania':'🇯🇴','Portugal':'🇵🇹','RD de Congo':'🇨🇩','Uzbekistán':'🇺🇿','Colombia':'🇨🇴','Inglaterra':'🏴󠁧󠁢󠁥󠁮󠁧󠁿','Croacia':'🇭🇷','Ghana':'🇬🇭','Panamá':'🇵🇦','EE.UU.':'🇺🇸','Holanda':'🇳🇱','Chequia':'🇨🇿','C. de Marfil':'🇨🇮'};
@@ -911,11 +971,16 @@ function renderAdmin(pane){
     html+=renderGruposHTML();
   } else if(pane==='resultados'){
     html+=`<div class="info-pill"><i class="ti ti-lock"></i> Al cargar el resultado las predicciones quedan <strong>bloqueadas</strong> para todos.</div>`;
+    html+=`<div class="info-pill" style="display:block;line-height:1.5">
+      <span class="src-chip auto">🤖 Auto</span> <strong>Grupos:</strong> se actualizan automáticamente desde la API cada ${UPDATE_INTERVAL_MINUTES} minutos (igual podés corregirlos a mano).<br>
+      <span class="src-chip manual">👤 Manual</span> <strong>Eliminatorias:</strong> las carga el administrador (resultado a 90 min + quién clasificó + cómo se resolvió).</div>`;
+    html+=`<div class="src-banner auto"><span class="src-chip auto">🤖 Auto</span> Fase de grupos — sincroniza desde la API</div>`;
     const grpDates=groupByDate(MG);
     grpDates.forEach(([dt,mts],idx)=>{
       html+=`<div class="jornada-hdr"><span class="j-num">J${idx+1}</span> <span>${fmtDateEs(parseDt(dt))}</span></div>`;
       mts.forEach(m=>{html+=rCard(m,false);});
     });
+    html+=`<div class="src-banner manual"><span class="src-chip manual">👤 Manual</span> Eliminatorias — las carga el administrador</div>`;
     const eps=[{k:'r32',l:'16avos'},{k:'qf',l:'Octavos'},{k:'sf',l:'Cuartos'},{k:'semif',l:'Semis'},{k:'tp',l:'3er Puesto'},{k:'final',l:'Final'}];
     eps.forEach(ep=>{
       const em=ME.filter(m=>m.ph===ep.k).sort((a,b)=>parseDt(a.dt)-parseDt(b.dt));
@@ -999,7 +1064,7 @@ function rCard(m,elim){
   if(!elim){
     return`<div class="match-row" style="${done?'border-color:#4caf50':''}">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;flex-wrap:wrap;gap:4px">
-        <span class="mteams">${tF(m.h)}<span class="vs">vs</span>${tF(m.a)} <span style="font-size:11px;color:var(--text3)">${m.dt}</span></span>
+        <span class="mteams">${tF(m.h)}<span class="vs">vs</span>${tF(m.a)} <span style="font-size:11px;color:var(--text3)">${m.dt}</span> <span class="src-chip auto">🤖 Auto</span></span>
         ${done?`<span class="badge bgreen">${r.h}–${r.a}</span>`:'<span class="badge bgray">pendiente</span>'}
       </div>
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
@@ -1014,7 +1079,7 @@ function rCard(m,elim){
   const hLbl=(getFlag(hRes)?getFlag(hRes)+' ':'')+hRes,aLbl=(getFlag(aRes)?getFlag(aRes)+' ':'')+aRes;
   return`<div class="match-row" id="el-card-${m.id}" style="${done?'border-color:#4caf50':''}">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;flex-wrap:wrap;gap:4px">
-      <span class="mteams">${tF(hRes)}<span class="vs">vs</span>${tF(aRes)} <span style="font-size:11px;color:var(--text3)">${m.dt}</span></span>
+      <span class="mteams">${tF(hRes)}<span class="vs">vs</span>${tF(aRes)} <span style="font-size:11px;color:var(--text3)">${m.dt}</span> <span class="src-chip manual">👤 Manual</span></span>
       <span id="el-badge-${m.id}">${elimBadge(m,r)}</span>
     </div>
     <div class="elim-step">
@@ -1117,26 +1182,18 @@ const FOOTBALL_API_URL='https://api.football-data.org/v4/competitions/WC/matches
 const CORS_PROXY='https://corsproxy.io/?';
 const UPDATE_INTERVAL_MINUTES=5;
 const TEAM_NAME_MAP={'Mexico':'México','South Africa':'Sudáfrica','South Korea':'Corea del Sur','Korea Republic':'Corea del Sur','Czech Republic':'República Checa','Czechia':'República Checa','Canada':'Canadá','Bosnia and Herzegovina':'Bosnia y Herzegovina','Australia':'Australia','Turkey':'Turquía','Türkiye':'Turquía','Germany':'Alemania','Curaçao':'Curazao','Curacao':'Curazao',"Côte d'Ivoire":'Costa de Marfil','Ivory Coast':'Costa de Marfil','Ecuador':'Ecuador','Netherlands':'Países Bajos','Japan':'Japón','Sweden':'Suecia','Tunisia':'Túnez','Belgium':'Bélgica','Egypt':'Egipto','Iran':'Irán','IR Iran':'Irán','New Zealand':'Nueva Zelanda','Spain':'España','Cabo Verde':'Cabo Verde','Cape Verde':'Cabo Verde','Saudi Arabia':'Arabia Saudita','Uruguay':'Uruguay','France':'Francia','Senegal':'Senegal','Iraq':'Irak','Norway':'Noruega','Argentina':'Argentina','Algeria':'Argelia','Austria':'Austria','Jordan':'Jordania','Portugal':'Portugal','DR Congo':'RD de Congo','Congo DR':'RD de Congo','Uzbekistan':'Uzbekistán','Colombia':'Colombia','England':'Inglaterra','Croatia':'Croacia','Ghana':'Ghana','Panama':'Panamá','Brazil':'Brasil','Morocco':'Marruecos','Haiti':'Haití','Scotland':'Escocia','United States':'Estados Unidos','USA':'Estados Unidos','Paraguay':'Paraguay','Qatar':'Qatar','Switzerland':'Suiza'};
-const STAGE_MAP={'GROUP_STAGE':'group','LAST_32':'r32','ROUND_OF_32':'r32','LAST_16':'qf','ROUND_OF_16':'qf','QUARTER_FINALS':'sf','SEMI_FINALS':'semif','THIRD_PLACE':'tp','3RD_PLACE':'tp','FINAL':'final'};
 let _syncState={status:'idle',lastSync:null,error:null,count:0};
 let _syncTimer=null;
 function getApiKey(){return(S.apiKey&&S.apiKey.length>10)?S.apiKey:FOOTBALL_API_KEY_DEFAULT;}
 function isAutoSyncEnabled(){return S.autoSync!==false;}
 function trTeam(n){return TEAM_NAME_MAP[n]||n;}
-function apiDateToDt(iso){const d=new Date(iso);const dd=String(d.getUTCDate()).padStart(2,'0');const mm=String(d.getUTCMonth()+1).padStart(2,'0');return dd+'/'+mm;}
+// Estado de la sync con football-data.org. Se muestra en el panel Admin › API
+// (el badge de abajo a la izquierda ahora refleja la sync del storage compartido).
 function renderSyncBadge(){
-  const el=document.getElementById('sync-badge');if(!el)return;
-  const s=_syncState;let cls='idle',icon='ti-cloud',txt='Sin sync';
-  if(s.status==='syncing'){cls='syncing';icon='ti-loader-2';txt='Sincronizando…';}
-  else if(s.status==='ok'){
-    cls='ok';icon='ti-cloud-check';
-    const mins=s.lastSync?Math.floor((Date.now()-s.lastSync)/60000):0;
-    txt=mins<1?'Sincronizado':`Sync hace ${mins}m`;
-  }
-  else if(s.status==='error'){cls='err';icon='ti-cloud-off';txt='Sin conexión';}
-  el.className='sync-badge '+cls;
-  el.innerHTML=`<i class="ti ${icon}"></i> <span>${txt}</span>`;
-  el.title=s.error?('Error: '+s.error):'Click para sincronizar ahora';
+  const ad=document.getElementById('sc-admin');
+  if(!ad||!ad.classList.contains('active'))return;
+  const a=document.querySelector('#sc-admin .nb.active');
+  if(a&&a.textContent.includes('API')&&!isEditing())renderAdmin('api');
 }
 async function fetchApiMatches(){
   const key=getApiKey();if(!key)throw new Error('Sin API key');
@@ -1156,38 +1213,13 @@ async function syncResultsFromAPI(){
       const awayES=trTeam(m.awayTeam&&m.awayTeam.name);
       const sh=parseInt(ft.home),sa=parseInt(ft.away);
       if(isNaN(sh)||isNaN(sa))return;
-      // 1) Grupo: matchear por nombres directamente en MG
+      // ⛔ SOLO fase de grupos (g1..g72). Las eliminatorias NO se tocan por API:
+      // las carga el admin a mano (90 min + resolución + clasificado).
       const mg=MG.find(x=>x.h===homeES&&x.a===awayES);
-      if(mg){
-        const cur=S.results[mg.id]||{};
-        if(cur.h!==sh||cur.a!==sa){S.results[mg.id]={...cur,h:sh,a:sa};changes++;}
-        return;
-      }
-      // 2) Eliminatorias: por stage + fecha
-      const phKey=STAGE_MAP[m.stage];if(!phKey||phKey==='group')return;
-      const apiDt=apiDateToDt(m.utcDate);
-      const cand=ME.filter(x=>x.ph===phKey&&x.dt===apiDt);
-      if(!cand.length)return;
-      // Si hay varios candidatos en el día, elegir el que su m.h resuelve al home de API o cuyo m.a resuelva al away
-      let me=cand.find(x=>{const rh=resolveSlot(x.h,x.id),ra=resolveSlot(x.a,x.id);return(rh===homeES&&ra===awayES)||(rh===awayES&&ra===homeES);});
-      if(!me)me=cand[0];
-      const hResolved=resolveSlot(me.h,me.id),aResolved=resolveSlot(me.a,me.id);
-      let sideH=sh,sideA=sa,advLabel=null;
-      // Si la API home corresponde a m.a, invertimos
-      if(hResolved===awayES&&aResolved===homeES){sideH=sa;sideA=sh;}
-      // Determinar ganador → label de m.h o m.a
-      let winnerTeamES=null;
-      if(sh>sa)winnerTeamES=homeES;
-      else if(sa>sh)winnerTeamES=awayES;
-      else if(m.score.winner==='HOME_TEAM')winnerTeamES=homeES;
-      else if(m.score.winner==='AWAY_TEAM')winnerTeamES=awayES;
-      if(winnerTeamES){
-        if(hResolved===winnerTeamES)advLabel=me.h;
-        else if(aResolved===winnerTeamES)advLabel=me.a;
-      }
-      const cur=S.results[me.id]||{};
-      const upd={h:sideH,a:sideA};if(advLabel)upd.adv=advLabel;
-      if(cur.h!==upd.h||cur.a!==upd.a||(advLabel&&cur.adv!==advLabel)){S.results[me.id]={...cur,...upd};changes++;}
+      if(!mg)return;                                   // si no es un partido de grupos, ignorar
+      if(!/^g\d+$/.test(mg.id))return;                 // doble seguro: solo IDs g###
+      const cur=S.results[mg.id]||{};
+      if(cur.h!==sh||cur.a!==sa){S.results[mg.id]={...cur,h:sh,a:sa};changes++;}
     });
     _syncState={status:'ok',lastSync:Date.now(),error:null,count:changes};
     if(changes>0){save();rerenderCurrent();}
@@ -1215,8 +1247,6 @@ function toggleAutoSync(){
   if(tog.checked)startAutoSync();else stopAutoSync();
   renderAdmin('api');
 }
-// Refresca el "hace X min" del badge cada 60s
-setInterval(renderSyncBadge,60000);
 
 // ====== Integrity check del fixture (corre 1 vez al cargar) ======
 (function validateFixtureIntegrity(){
